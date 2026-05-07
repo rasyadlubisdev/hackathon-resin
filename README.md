@@ -1,4 +1,4 @@
-# Resinsep — Resin Separation Cycle Dashboard (Next.js + Firebase)
+# Resinsep - Resin Separation Cycle Dashboard (Next.js + Firebase)
 
 Resinsep adalah aplikasi web dashboard untuk **mencatat, memonitor, dan mengevaluasi siklus pemisahan resin** (*cycle*) pada proses pengolahan plastik. Aplikasi mencakup **autentikasi pengguna**, **pembuatan cycle baru (input → output → monitoring)**, **riwayat (history)**, serta **detail cycle** yang menyimpan komposisi resin, tahapan pemisahan (*stages*), **recovery (%)**, dan estimasi **revenue**.
 
@@ -61,12 +61,7 @@ PDF berisi ringkasan lengkap yang siap digunakan untuk laporan operasional:
    npm install
    ```
 
-2. **Tambahkan dependency PDF Export** (jika belum ada):
-   ```bash
-   npm install jspdf jspdf-autotable
-   ```
-
-3. **Konfigurasi Environment**:  
+2. **Konfigurasi Environment**:  
    Buat file `.env.local` di root folder:
    ```env
    NEXT_PUBLIC_FIREBASE_API_KEY=your_api_key
@@ -77,7 +72,7 @@ PDF berisi ringkasan lengkap yang siap digunakan untuk laporan operasional:
    NEXT_PUBLIC_FIREBASE_APP_ID=your_app_id
    ```
 
-4. **Development Mode**:
+3. **Development Mode**:
    ```bash
    npm run dev
    ```
@@ -111,7 +106,7 @@ Alur demo yang paling efektif untuk memperlihatkan nilai aplikasi secara cepat:
 
 ### New Cycle Process
 
-| Step 1: Input | Step 2: Output | Step 3: Monitor |
+| Step 1: Input | Step 2: Monitor | Step 3: Output |
 | :---: | :---: | :---: |
 | ![New Cycle Input](./public/capture-newcycle-input.jpeg) | ![New Cycle Output](./public/capture-newcycle-output.jpeg) | ![New Cycle Monitor](./public/capture-newcylce-monitor.jpeg) |
 
@@ -120,6 +115,12 @@ Alur demo yang paling efektif untuk memperlihatkan nilai aplikasi secara cepat:
 | History (Cycles List) | History Detail |
 | :---: | :---: |
 | ![History](./public/capture-history.jpeg) | ![History Detail](./public/capture-history-detail.jpeg) |
+
+### Exported PDF
+
+| Print PDF |
+| :---: | 
+| ![Pdf](./public/capture-pdf.png) |
 
 ## 📁 Struktur Folder
 
