@@ -35,9 +35,10 @@ Dalam proses pengolahan plastik, pencatatan input vs output, durasi, dan hasil p
 
 ## 📄 Export PDF (Laporan Siklus)
 
-Fitur **Export PDF** tersedia di halaman detail cycle: **`/cycles/[id]`**. Saat tombol **“Export PDF”** ditekan, aplikasi akan:
+Fitur **Export PDF** tersedia di halaman detail cycle: **`/cycles/[id]`** dan di halaman performance: **`/performance`** . Saat tombol **“Export PDF”** ditekan, aplikasi akan:
 
-- Mengambil data cycle yang sedang dibuka (informasi batch, ringkasan proses, stages, dan output resin).
+- Mengambil data cycle yang sedang dibuka (informasi batch, ringkasan proses, stages, dan output resin) untuk di halaman detail.
+- Mengambil data analisis informasi performa mesin, cairan, ataupun operator (informasi batch, informasi mesin, kualitas proses, kinerja alat, dan kinerja operator)
 - Menghasilkan file PDF **di sisi client (browser)** menggunakan `jspdf` dan `jspdf-autotable`.
 - Memicu **download otomatis** dengan nama file: `cycle-<cycleId>.pdf`  
   Contoh: `cycle-RSP-20260507-001.pdf`
