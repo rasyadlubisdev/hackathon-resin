@@ -1,6 +1,7 @@
 "use client";
-import { useRouter } from "next/navigation";
-import { FileText, ArrowLeft, Loader2 } from "lucide-react";
+
+import { useMemo, useState } from "react";
+import { FileText, Loader2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -13,7 +14,10 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { useState, useMemo } from "react";
+
+// ✅ static import: lebih stabil (hindari ChunkLoadError)
+import { jsPDF } from "jspdf";
+import autoTable from "jspdf-autotable";
 
 // =====================
 // Types LOKAL (karena src/types/index.ts belum punya ShiftLog)
@@ -28,36 +32,29 @@ type TaskItem = { title: string; done?: boolean; note?: string };
 type OperatorShift = {
   operatorId: string;
   fullName: string;
-  shiftStartAt: string; // ISO string / string
-  shiftEndAt: string; // ISO string / string
-  tasks: TaskItem[]; // list
-  notes: string; // catatan global untuk semuanya
+  shiftStartAt: string;
+  shiftEndAt: string;
+  tasks: TaskItem[];
+  notes: string;
 };
 
 type LiquidStockCheck = {
   liquidType: LiquidType;
+  stockId: string;
+  supplierBatchId: string;
 
-  stockId: string; // id stock tiap cairan
-  supplierBatchId: string; // per batch supplier
+  volumeStartShiftLiters: number; // total awal = awal shift
+  volumeBeforeLiters: number;     // sebelum pengecekan (pada saat check)
+  volumeAfterLiters: number;      // setelah koreksi / hasil sensor
 
-  // keputusan: total awal = awal shift
-  volumeStartShiftLiters: number;
-
-  // keputusan: before/after saat check
-  volumeBeforeLiters: number;
-  volumeAfterLiters: number;
-
-  // keputusan: refill
   lastRefillLiters?: number;
   lastRefillAt?: string;
 
-  // keputusan: metode cek + metadata
   checkMethod: CheckMethod;
   checkedAt: string;
-  checkedByOperatorId?: string | null; // nullable kalau sensor
+  checkedByOperatorId?: string | null;
 
-  // keputusan: kualitas per batch (A/B/C/D)
-  qualityGrade: QualityGrade;
+  qualityGrade: QualityGrade; // A/B/C/D (per batch)
 };
 
 type EquipmentSnapshot = {
@@ -67,37 +64,31 @@ type EquipmentSnapshot = {
   manufacturer: string;
   capacityKgPerHour: number;
 
-  // keputusan: status aktif state lengkap
   state: EquipmentState;
 
-  // keputusan: runtime total + per periode (today/cycle)
   runtimeHoursTotal: number;
   runtimeMinutesToday?: number;
-  runtimeMinutesCycle?: number; // cycle proses produksi
+  runtimeMinutesCycle?: number;
 
   lastServiceAt?: string;
 
-  // keputusan: energi per hari (kWh)
   energyKwhToday: number;
 
-  // keputusan: output per periode
   outputKgShift?: number;
   outputKgToday?: number;
   outputKgBatch?: number;
 
-  // keputusan: cycle proses produksi
   productionCycleId?: string;
   batchId?: string;
 };
 
 type DryingReusableLog = {
-  pickupLiquidId: string; // id pengambilan cairan
+  pickupLiquidId: string;
   operatorId: string;
-  lastPickedAt: string; // terakhir diambil cairan
-  state: EquipmentState; // state lengkap
+  lastPickedAt: string;
+  state: EquipmentState;
   totalLiquidTakenLiters: number;
 
-  // keputusan: kelembapan eksplisit
   humidityType: "RH" | "MOISTURE_CONTENT";
   humidityValue: number;
 };
@@ -112,7 +103,7 @@ type ShiftLog = {
 };
 
 // =====================
-// UI Helpers
+// UI Helpers (Web)
 // =====================
 function InfoRow({
   label,
@@ -173,11 +164,7 @@ const STATIC_SHIFT_LOG: ShiftLog = {
     shiftEndAt: "2026-05-15T16:00:00+07:00",
     tasks: [
       { title: "Cek volume ETHANOL (manual)", done: true },
-      {
-        title: "Monitoring shredder 2 jam",
-        done: false,
-        note: "Menunggu bahan masuk",
-      },
+      { title: "Monitoring shredder 2 jam", done: false, note: "Menunggu bahan masuk" },
       { title: "Kalibrasi sensor CaCl2", done: true },
     ],
     notes: "Catatan global shift: kondisi stabil, RH meningkat siang hari.",
@@ -276,146 +263,249 @@ const STATIC_SHIFT_LOG: ShiftLog = {
 };
 
 export default function PerformancePage() {
-  const router = useRouter();
   const [exporting, setExporting] = useState(false);
-
   const data = STATIC_SHIFT_LOG;
 
   const totals = useMemo(() => {
-    const totalStart = data.liquids.reduce(
-      (a, x) => a + x.volumeStartShiftLiters,
-      0,
-    );
-    const totalBefore = data.liquids.reduce(
-      (a, x) => a + x.volumeBeforeLiters,
-      0,
-    );
-    const totalAfter = data.liquids.reduce(
-      (a, x) => a + x.volumeAfterLiters,
-      0,
-    );
-    const totalRefill = data.liquids.reduce(
-      (a, x) => a + (x.lastRefillLiters ?? 0),
-      0,
-    );
-    return { totalStart, totalBefore, totalAfter, totalRefill };
+    const totalStart = data.liquids.reduce((a, x) => a + x.volumeStartShiftLiters, 0);
+    const totalBefore = data.liquids.reduce((a, x) => a + x.volumeBeforeLiters, 0);
+    const totalAfter = data.liquids.reduce((a, x) => a + x.volumeAfterLiters, 0);
+    const totalRefill = data.liquids.reduce((a, x) => a + (x.lastRefillLiters ?? 0), 0);
+
+    const energyTodayTotal = (data.shredder.energyKwhToday ?? 0) + (data.densitySeparator.energyKwhToday ?? 0);
+
+    const outShift =
+      (data.shredder.outputKgShift ?? 0) + (data.densitySeparator.outputKgShift ?? 0);
+
+    const outToday =
+      (data.shredder.outputKgToday ?? 0) + (data.densitySeparator.outputKgToday ?? 0);
+
+    const outBatch =
+      (data.shredder.outputKgBatch ?? 0) + (data.densitySeparator.outputKgBatch ?? 0);
+
+    return {
+      totalStart,
+      totalBefore,
+      totalAfter,
+      totalRefill,
+      energyTodayTotal,
+      outShift,
+      outToday,
+      outBatch,
+    };
   }, [data]);
 
   const handleExportPdf = async () => {
     setExporting(true);
+
     try {
-      const [{ jsPDF }, autoTableMod] = await Promise.all([
-        import("jspdf"),
-        import("jspdf-autotable"),
-      ]);
+      // ✅ Landscape A4 agar tabel cairan tidak overflow
+      const doc = new jsPDF({ unit: "pt", format: "a4", orientation: "landscape" });
 
-      const autoTable =
-        (autoTableMod as any).default ||
-        (autoTableMod as any).autoTable ||
-        null;
-
-      const doc = new jsPDF({ unit: "pt", format: "a4" });
       const pageW = doc.internal.pageSize.getWidth();
       const pageH = doc.internal.pageSize.getHeight();
-      const marginX = 40;
-      let y = 44;
+      const M = { left: 40, right: 40, top: 56, bottom: 42 };
+
+      const nowStr = new Date().toLocaleString("id-ID");
 
       const safe = (v: any) =>
         v === null || v === undefined || v === "" ? "-" : String(v);
 
-      const hLine = (yy: number) => {
-        doc.setDrawColor(220);
-        doc.line(marginX, yy, pageW - marginX, yy);
-      };
+      const fmtLit = (n: number) => `${fmtNum(n, 1)} L`;
+      const fmtK = (n: number) => `${fmtNum(n, 1)} kg`;
+      const fmtE = (n: number) => `${fmtNum(n, 2)} kWh`;
 
-      const sectionTitle = (title: string) => {
+      // ---------- Header/Footer (untuk halaman 2 & 3) ----------
+      const drawHeader = () => {
         doc.setFont("helvetica", "bold");
         doc.setFontSize(12);
-        doc.text(title, marginX, y);
-        y += 10;
-        hLine(y);
-        y += 16;
-      };
+        doc.text("Analisis Performa (Shift Log)", M.left, 28);
 
-      const kv = (label: string, value: string) => {
         doc.setFont("helvetica", "normal");
-        doc.setFontSize(10);
-        doc.text(label, marginX, y);
-        doc.setFont("helvetica", "bold");
-        doc.text(value, pageW - marginX, y, { align: "right" });
-        y += 16;
+        doc.setFontSize(9);
+        doc.setTextColor(90);
+        doc.text(`ShiftLog: ${safe(data.shiftLogId)}`, M.left, 42);
+        doc.text(`Diekspor: ${nowStr}`, pageW - M.right, 42, { align: "right" });
+        doc.setTextColor(0);
       };
 
-      // Header
+      const drawFooter = () => {
+        const p = doc.getCurrentPageInfo().pageNumber;
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(8);
+        doc.setTextColor(120);
+        doc.text("ResinSep — Shift Performance Report", M.left, pageH - 18);
+        doc.text(`Hal. ${p}/3`, pageW - M.right, pageH - 18, { align: "right" });
+        doc.setTextColor(0);
+      };
+
+      // ---------- Helpers layout ----------
+      const hLine = (y: number) => {
+        doc.setDrawColor(220);
+        doc.line(M.left, y, pageW - M.right, y);
+      };
+
+      const box = (x: number, y: number, w: number, h: number, title: string, lines: string[]) => {
+        doc.setDrawColor(226);
+        doc.setFillColor(248, 250, 252);
+        doc.roundedRect(x, y, w, h, 10, 10, "FD");
+
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(10);
+        doc.text(title, x + 12, y + 18);
+
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(9);
+        doc.setTextColor(60);
+        const maxW = w - 24;
+        let yy = y + 34;
+        for (const l of lines) {
+          const wrapped = doc.splitTextToSize(l, maxW);
+          doc.text(wrapped, x + 12, yy);
+          yy += wrapped.length * 11;
+          if (yy > y + h - 10) break;
+        }
+        doc.setTextColor(0);
+      };
+
+      // =========================================================
+      // PAGE 1/3 — COVER + RINGKASAN
+      // =========================================================
+      // Cover tidak pakai header standar (biar clean)
       doc.setFont("helvetica", "bold");
-      doc.setFontSize(16);
-      doc.text("Analisis Performa (Shift Log)", marginX, y);
+      doc.setFontSize(22);
+      doc.text("Laporan Performa Shift", M.left, 80);
 
       doc.setFont("helvetica", "normal");
-      doc.setFontSize(10);
-      doc.text(`ShiftLog ID: ${safe(data.shiftLogId)}`, pageW - marginX, y, {
-        align: "right",
-      });
-      y += 18;
-
-      doc.setFontSize(9);
-      doc.setTextColor(90);
-      doc.text(`Diekspor: ${new Date().toLocaleString("id-ID")}`, marginX, y);
+      doc.setFontSize(11);
+      doc.setTextColor(80);
+      doc.text("Ringkasan Operasional, Cairan, dan Kondisi Alat", M.left, 104);
       doc.setTextColor(0);
-      y += 18;
 
-      hLine(y);
-      y += 18;
+      hLine(120);
 
-      // Operator
-      sectionTitle("Informasi Operator (Shift)");
-      kv("Operator ID", safe(data.operator.operatorId));
-      kv("Nama", safe(data.operator.fullName));
-      kv("Mulai Shift", safe(data.operator.shiftStartAt));
-      kv("Selesai Shift", safe(data.operator.shiftEndAt));
-      kv("Catatan Global", safe(data.operator.notes));
+      // Meta kanan
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
+      doc.setTextColor(80);
+      doc.text(`ShiftLog ID: ${safe(data.shiftLogId)}`, pageW - M.right, 86, { align: "right" });
+      doc.text(`Diekspor: ${nowStr}`, pageW - M.right, 106, { align: "right" });
+      doc.setTextColor(0);
 
-      y += 8;
+      // KPI cards (2 kolom x 2 baris)
+      const gap = 16;
+      const colW = (pageW - M.left - M.right - gap) / 2;
+      const cardH = 140;
+      let y = 150;
 
-      // Tasks table
-      sectionTitle("Task Hari Ini");
-      const taskHead = [["No", "Task", "Status", "Catatan"]];
-      const taskBody = data.operator.tasks.map((t, i) => [
-        String(i + 1),
-        safe(t.title),
-        t.done ? "Selesai" : "Belum",
-        safe(t.note ?? "-"),
-      ]);
-
-      const taskOpt = {
-        startY: y,
-        head: taskHead,
-        body: taskBody,
-        theme: "grid",
-        styles: { font: "helvetica", fontSize: 9, cellPadding: 6 },
-        headStyles: { fillColor: [30, 41, 59], textColor: 255 },
-        margin: { left: marginX, right: marginX },
-      };
-
-      if (typeof autoTable === "function") autoTable(doc, taskOpt);
-      else (doc as any).autoTable(taskOpt);
-
-      y = ((doc as any).lastAutoTable?.finalY ?? y) + 18;
-
-      // Liquids
-      sectionTitle("Informasi Cairan (Per Batch)");
-      kv("Total Awal Shift", fmtLiters(totals.totalStart));
-      kv("Total Sebelum Cek", fmtLiters(totals.totalBefore));
-      kv("Total Setelah Cek", fmtLiters(totals.totalAfter));
-      kv("Total Refill", fmtLiters(totals.totalRefill));
-
-      y += 8;
-
-      const liqHead = [
+      box(
+        M.left,
+        y,
+        colW,
+        cardH,
+        "Operator & Shift",
         [
+          `Operator ID: ${safe(data.operator.operatorId)}`,
+          `Nama: ${safe(data.operator.fullName)}`,
+          `Mulai: ${safe(data.operator.shiftStartAt)}`,
+          `Selesai: ${safe(data.operator.shiftEndAt)}`,
+        ]
+      );
+
+      box(
+        M.left + colW + gap,
+        y,
+        colW,
+        cardH,
+        "Ringkasan Cairan",
+        [
+          `Total Awal Shift: ${fmtLit(totals.totalStart)}`,
+          `Total Sebelum Cek: ${fmtLit(totals.totalBefore)}`,
+          `Total Setelah Cek: ${fmtLit(totals.totalAfter)}`,
+          `Total Refill: ${fmtLit(totals.totalRefill)}`,
+        ]
+      );
+
+      y += cardH + gap;
+
+      box(
+        M.left,
+        y,
+        colW,
+        cardH,
+        "Kinerja Alat (Hari Ini)",
+        [
+          `Energy Today (Total): ${fmtE(totals.energyTodayTotal)}`,
+          `Output Shift (Total): ${totals.outShift ? fmtK(totals.outShift) : "-"}`,
+          `Output Today (Total): ${totals.outToday ? fmtK(totals.outToday) : "-"}`,
+          `Output Batch (Total): ${totals.outBatch ? fmtK(totals.outBatch) : "-"}`,
+        ]
+      );
+
+      const humidityText =
+        data.dryingReusable.humidityType === "RH"
+          ? `${safe(data.dryingReusable.humidityValue)}% RH`
+          : `${safe(data.dryingReusable.humidityValue)}% (Moisture)`;
+
+      box(
+        M.left + colW + gap,
+        y,
+        colW,
+        cardH,
+        "Pengeringan & Reusable",
+        [
+          `Pickup ID: ${safe(data.dryingReusable.pickupLiquidId)}`,
+          `Operator ID: ${safe(data.dryingReusable.operatorId)}`,
+          `Terakhir Diambil: ${safe(data.dryingReusable.lastPickedAt)}`,
+          `State: ${safe(data.dryingReusable.state)}`,
+          `Cairan Diambil: ${fmtLit(data.dryingReusable.totalLiquidTakenLiters)}`,
+          `Kelembapan: ${humidityText}`,
+        ]
+      );
+
+      // Catatan global ringkas di bawah
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(10);
+      doc.text("Catatan Global:", M.left, pageH - 70);
+
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      doc.setTextColor(60);
+      const notesWrapped = doc.splitTextToSize(safe(data.operator.notes), pageW - M.left - M.right);
+      doc.text(notesWrapped, M.left, pageH - 54);
+      doc.setTextColor(0);
+
+      // Footer cover
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(8);
+      doc.setTextColor(120);
+      doc.text("ResinSep — Shift Performance Report", M.left, pageH - 18);
+      doc.text("Hal. 1/3", pageW - M.right, pageH - 18, { align: "right" });
+      doc.setTextColor(0);
+
+      // =========================================================
+      // PAGE 2/3 — TABEL CAIRAN (FULL)
+      // =========================================================
+      doc.addPage();
+      drawHeader();
+
+      let y2 = M.top;
+
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(12);
+      doc.text("Detail Cairan (Per Batch Supplier)", M.left, y2);
+      y2 += 10;
+      hLine(y2);
+      y2 += 14;
+
+      autoTable(doc, {
+        startY: y2,
+        margin: M,
+        theme: "grid",
+        head: [[
           "Cairan",
-          "Stock ID",
-          "Supplier Batch",
+          "Stock",
+          "Batch Supplier",
           "Awal Shift (L)",
           "Before (L)",
           "After (L)",
@@ -424,129 +514,199 @@ export default function PerformancePage() {
           "Waktu Cek",
           "Checked By",
           "Grade",
-        ],
-      ];
+        ]],
+        body: data.liquids.map((l) => [
+          safe(l.liquidType),
+          safe(l.stockId),
+          safe(l.supplierBatchId),
+          fmtNum(l.volumeStartShiftLiters, 1),
+          fmtNum(l.volumeBeforeLiters, 1),
+          fmtNum(l.volumeAfterLiters, 1),
+          l.lastRefillLiters !== undefined ? fmtNum(l.lastRefillLiters, 1) : "-",
+          safe(l.checkMethod),
+          safe(l.checkedAt),
+          safe(l.checkedByOperatorId ?? "-"),
+          safe(l.qualityGrade),
+        ]),
+        styles: {
+          font: "helvetica",
+          fontSize: 8,
+          cellPadding: 4,
+          overflow: "linebreak",
+          valign: "top",
+        },
+        headStyles: {
+          fillColor: [30, 41, 59],
+          textColor: 255,
+          fontSize: 8,
+        },
+        alternateRowStyles: { fillColor: [248, 250, 252] },
+        // kunci anti-overflow: fixed widths
+        columnStyles: {
+          0: { cellWidth: 62 },
+          1: { cellWidth: 78 },
+          2: { cellWidth: 170 }, // batch panjang -> wrap
+          3: { cellWidth: 55, halign: "right" },
+          4: { cellWidth: 55, halign: "right" },
+          5: { cellWidth: 55, halign: "right" },
+          6: { cellWidth: 55, halign: "right" },
+          7: { cellWidth: 58 },
+          8: { cellWidth: 125 }, // timestamp -> wrap
+          9: { cellWidth: 70 },
+          10: { cellWidth: 50, halign: "center" },
+        },
+        didDrawPage: () => {
+          drawHeader();
+          drawFooter();
+        },
+      });
 
-      const liqBody = data.liquids.map((l) => [
-        safe(l.liquidType),
-        safe(l.stockId),
-        safe(l.supplierBatchId),
-        safe(l.volumeStartShiftLiters),
-        safe(l.volumeBeforeLiters),
-        safe(l.volumeAfterLiters),
-        safe(l.lastRefillLiters ?? "-"),
-        safe(l.checkMethod),
-        safe(l.checkedAt),
-        safe(l.checkedByOperatorId ?? "-"),
-        safe(l.qualityGrade),
-      ]);
+      // footer page 2 (jaga kalau autoTable tidak memanggil didDrawPage saat kecil)
+      drawFooter();
 
-      const liqOpt = {
-        startY: y,
-        head: liqHead,
-        body: liqBody,
+      // =========================================================
+      // PAGE 3/3 — TASKS + EQUIPMENT + DRYING
+      // =========================================================
+      doc.addPage();
+      drawHeader();
+
+      let y3 = M.top;
+
+      // --- Tasks ---
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(12);
+      doc.text("Task Hari Ini", M.left, y3);
+      y3 += 10;
+      hLine(y3);
+      y3 += 14;
+
+      autoTable(doc, {
+        startY: y3,
+        margin: M,
         theme: "grid",
-        styles: { font: "helvetica", fontSize: 8.5, cellPadding: 5 },
-        headStyles: { fillColor: [30, 41, 59], textColor: 255 },
-        margin: { left: marginX, right: marginX },
+        head: [["No", "Task", "Status", "Catatan"]],
+        body: data.operator.tasks.map((t, i) => [
+          String(i + 1),
+          safe(t.title),
+          t.done ? "Selesai" : "Belum",
+          safe(t.note ?? "-"),
+        ]),
+        styles: {
+          font: "helvetica",
+          fontSize: 9,
+          cellPadding: 5,
+          overflow: "linebreak",
+          valign: "top",
+        },
+        headStyles: {
+          fillColor: [30, 41, 59],
+          textColor: 255,
+        },
+        alternateRowStyles: { fillColor: [248, 250, 252] },
+        columnStyles: {
+          0: { cellWidth: 30, halign: "right" },
+          1: { cellWidth: 340 },
+          2: { cellWidth: 80 },
+          3: { cellWidth: 240 },
+        },
+        didDrawPage: () => {
+          drawHeader();
+          drawFooter();
+        },
+      });
+
+      y3 = ((doc as any).lastAutoTable?.finalY ?? y3) + 16;
+
+      // --- Equipment Shredder & Density (dua tabel key-value) ---
+      const equipToBody = (e: EquipmentSnapshot) => {
+        return [
+          ["Equipment ID", safe(e.equipmentId)],
+          ["Nama", safe(e.name)],
+          ["Pabrik", safe(e.manufacturer)],
+          ["Kapasitas", `${safe(e.capacityKgPerHour)} kg/jam`],
+          ["State", safe(e.state)],
+          ["Hour Meter (Total)", `${fmtNum(e.runtimeHoursTotal, 1)} jam`],
+          ["Runtime Today", e.runtimeMinutesToday !== undefined ? `${e.runtimeMinutesToday} menit` : "-"],
+          ["Runtime Cycle", e.runtimeMinutesCycle !== undefined ? `${e.runtimeMinutesCycle} menit` : "-"],
+          ["Energy Today", fmtE(e.energyKwhToday)],
+          ["Output Shift", e.outputKgShift !== undefined ? fmtK(e.outputKgShift) : "-"],
+          ["Output Today", e.outputKgToday !== undefined ? fmtK(e.outputKgToday) : "-"],
+          ["Output Batch", e.outputKgBatch !== undefined ? fmtK(e.outputKgBatch) : "-"],
+          ["Batch ID", safe(e.batchId ?? "-")],
+          ["Production Cycle ID", safe(e.productionCycleId ?? "-")],
+          ["Terakhir Servis", safe(e.lastServiceAt ?? "-")],
+        ];
       };
 
-      if (typeof autoTable === "function") autoTable(doc, liqOpt);
-      else (doc as any).autoTable(liqOpt);
+      autoTable(doc, {
+        startY: y3,
+        margin: M,
+        theme: "grid",
+        head: [["Shredder", "Nilai"]],
+        body: equipToBody(data.shredder),
+        styles: { font: "helvetica", fontSize: 9, cellPadding: 5, overflow: "linebreak" },
+        headStyles: { fillColor: [30, 41, 59], textColor: 255 },
+        columnStyles: {
+          0: { cellWidth: 200 },
+          1: { cellWidth: pageW - M.left - M.right - 200 },
+        },
+        didDrawPage: () => {
+          drawHeader();
+          drawFooter();
+        },
+      });
 
-      y = ((doc as any).lastAutoTable?.finalY ?? y) + 18;
+      y3 = ((doc as any).lastAutoTable?.finalY ?? y3) + 12;
 
-      // Equipment (ringkas)
-      sectionTitle("Informasi Alat (Snapshot)");
-      const eqKV = (label: string, value: string) => kv(label, value);
+      autoTable(doc, {
+        startY: y3,
+        margin: M,
+        theme: "grid",
+        head: [["Density Separator", "Nilai"]],
+        body: equipToBody(data.densitySeparator),
+        styles: { font: "helvetica", fontSize: 9, cellPadding: 5, overflow: "linebreak" },
+        headStyles: { fillColor: [30, 41, 59], textColor: 255 },
+        columnStyles: {
+          0: { cellWidth: 200 },
+          1: { cellWidth: pageW - M.left - M.right - 200 },
+        },
+        didDrawPage: () => {
+          drawHeader();
+          drawFooter();
+        },
+      });
 
-      doc.setFont("helvetica", "bold");
-      doc.setFontSize(11);
-      doc.text("Shredder", marginX, y);
-      y += 14;
-      eqKV("State", data.shredder.state);
-      eqKV("Hour Meter", `${fmtNum(data.shredder.runtimeHoursTotal, 1)} jam`);
-      eqKV(
-        "Runtime Today",
-        data.shredder.runtimeMinutesToday !== undefined
-          ? `${data.shredder.runtimeMinutesToday} menit`
-          : "-",
-      );
-      eqKV("Energy Today", fmtKwh(data.shredder.energyKwhToday));
-      eqKV(
-        "Output Shift",
-        data.shredder.outputKgShift !== undefined
-          ? fmtKg(data.shredder.outputKgShift)
-          : "-",
-      );
-      eqKV(
-        "Output Today",
-        data.shredder.outputKgToday !== undefined
-          ? fmtKg(data.shredder.outputKgToday)
-          : "-",
-      );
-      eqKV("Production Cycle ID", safe(data.shredder.productionCycleId ?? "-"));
+      y3 = ((doc as any).lastAutoTable?.finalY ?? y3) + 12;
 
-      y += 8;
-      hLine(y);
-      y += 18;
+      // --- Drying & Reusable ---
+      autoTable(doc, {
+        startY: y3,
+        margin: M,
+        theme: "grid",
+        head: [["Pengeringan & Reusable Cairan", "Nilai"]],
+        body: [
+          ["Pickup Liquid ID", safe(data.dryingReusable.pickupLiquidId)],
+          ["Operator ID", safe(data.dryingReusable.operatorId)],
+          ["Terakhir Diambil", safe(data.dryingReusable.lastPickedAt)],
+          ["State", safe(data.dryingReusable.state)],
+          ["Total Cairan Diambil", fmtLit(data.dryingReusable.totalLiquidTakenLiters)],
+          ["Kondisi Kelembapan", humidityText],
+        ],
+        styles: { font: "helvetica", fontSize: 9, cellPadding: 5, overflow: "linebreak" },
+        headStyles: { fillColor: [30, 41, 59], textColor: 255 },
+        columnStyles: {
+          0: { cellWidth: 200 },
+          1: { cellWidth: pageW - M.left - M.right - 200 },
+        },
+        didDrawPage: () => {
+          drawHeader();
+          drawFooter();
+        },
+      });
 
-      doc.setFont("helvetica", "bold");
-      doc.setFontSize(11);
-      doc.text("Density Separator", marginX, y);
-      y += 14;
-      eqKV("State", data.densitySeparator.state);
-      eqKV(
-        "Hour Meter",
-        `${fmtNum(data.densitySeparator.runtimeHoursTotal, 1)} jam`,
-      );
-      eqKV(
-        "Runtime Cycle",
-        data.densitySeparator.runtimeMinutesCycle !== undefined
-          ? `${data.densitySeparator.runtimeMinutesCycle} menit`
-          : "-",
-      );
-      eqKV("Energy Today", fmtKwh(data.densitySeparator.energyKwhToday));
-      eqKV(
-        "Output Batch",
-        data.densitySeparator.outputKgBatch !== undefined
-          ? fmtKg(data.densitySeparator.outputKgBatch)
-          : "-",
-      );
-      eqKV("Batch ID", safe(data.densitySeparator.batchId ?? "-"));
-      eqKV(
-        "Production Cycle ID",
-        safe(data.densitySeparator.productionCycleId ?? "-"),
-      );
+      drawFooter();
 
-      // Drying/Reusable
-      sectionTitle("Pengeringan & Reusable Cairan");
-      kv("Pickup Liquid ID", safe(data.dryingReusable.pickupLiquidId));
-      kv("Operator ID", safe(data.dryingReusable.operatorId));
-      kv("Terakhir Diambil", safe(data.dryingReusable.lastPickedAt));
-      kv("State", safe(data.dryingReusable.state));
-      kv(
-        "Total Cairan Diambil",
-        fmtLiters(data.dryingReusable.totalLiquidTakenLiters),
-      );
-      kv(
-        "Kelembapan",
-        data.dryingReusable.humidityType === "RH"
-          ? `${safe(data.dryingReusable.humidityValue)}% RH`
-          : `${safe(data.dryingReusable.humidityValue)}% (Moisture)`,
-      );
-
-      // Footer
-      doc.setFont("helvetica", "normal");
-      doc.setFontSize(8);
-      doc.setTextColor(120);
-      doc.text(
-        "ResinSep — Shift Performance Report (Static)",
-        marginX,
-        pageH - 24,
-      );
-      doc.setTextColor(0);
-
+      // ✅ Save
       doc.save(`shift-${safe(data.shiftLogId)}.pdf`);
     } catch (err) {
       console.error("Gagal ekspor PDF:", err);
@@ -558,7 +718,7 @@ export default function PerformancePage() {
 
   return (
     <div>
-      {/* Header */}
+      {/* Header Web */}
       <div className="flex items-center gap-3 mb-6 flex-wrap">
         <h1 className="text-xl font-bold text-foreground">
           Analisis Performa (Shift)
@@ -600,22 +760,10 @@ export default function PerformancePage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <InfoRow
-              label="Operator ID"
-              value={data.operator.operatorId}
-              mono
-            />
+            <InfoRow label="Operator ID" value={data.operator.operatorId} mono />
             <InfoRow label="Nama Lengkap" value={data.operator.fullName} />
-            <InfoRow
-              label="Mulai Shift"
-              value={data.operator.shiftStartAt}
-              mono
-            />
-            <InfoRow
-              label="Selesai Shift"
-              value={data.operator.shiftEndAt}
-              mono
-            />
+            <InfoRow label="Mulai Shift" value={data.operator.shiftStartAt} mono />
+            <InfoRow label="Selesai Shift" value={data.operator.shiftEndAt} mono />
             <InfoRow label="Catatan Global" value={data.operator.notes} />
           </CardContent>
         </Card>
@@ -627,22 +775,10 @@ export default function PerformancePage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <InfoRow
-              label="Total Awal Shift"
-              value={fmtLiters(totals.totalStart)}
-            />
-            <InfoRow
-              label="Total Sebelum Cek"
-              value={fmtLiters(totals.totalBefore)}
-            />
-            <InfoRow
-              label="Total Setelah Cek"
-              value={fmtLiters(totals.totalAfter)}
-            />
-            <InfoRow
-              label="Total Refill"
-              value={fmtLiters(totals.totalRefill)}
-            />
+            <InfoRow label="Total Awal Shift" value={fmtLiters(totals.totalStart)} />
+            <InfoRow label="Total Sebelum Cek" value={fmtLiters(totals.totalBefore)} />
+            <InfoRow label="Total Setelah Cek" value={fmtLiters(totals.totalAfter)} />
+            <InfoRow label="Total Refill" value={fmtLiters(totals.totalRefill)} />
           </CardContent>
         </Card>
       </div>
@@ -704,52 +840,36 @@ export default function PerformancePage() {
               ))}
             </TableRow>
           </TableHeader>
-
           <TableBody>
             {data.liquids.map((l, i) => (
               <TableRow key={i}>
                 <TableCell className="font-semibold text-sm text-primary">
                   {l.liquidType}
                 </TableCell>
-                <TableCell className="font-mono text-[11px]">
-                  {l.stockId}
-                </TableCell>
+                <TableCell className="font-mono text-[11px]">{l.stockId}</TableCell>
                 <TableCell className="font-mono text-[11px] text-muted-foreground">
                   {l.supplierBatchId}
                 </TableCell>
+                <TableCell className="font-mono text-sm">{fmtLiters(l.volumeStartShiftLiters)}</TableCell>
+                <TableCell className="font-mono text-sm">{fmtLiters(l.volumeBeforeLiters)}</TableCell>
+                <TableCell className="font-mono text-sm">{fmtLiters(l.volumeAfterLiters)}</TableCell>
                 <TableCell className="font-mono text-sm">
-                  {fmtLiters(l.volumeStartShiftLiters)}
-                </TableCell>
-                <TableCell className="font-mono text-sm">
-                  {fmtLiters(l.volumeBeforeLiters)}
-                </TableCell>
-                <TableCell className="font-mono text-sm">
-                  {fmtLiters(l.volumeAfterLiters)}
-                </TableCell>
-                <TableCell className="font-mono text-sm">
-                  {l.lastRefillLiters !== undefined
-                    ? fmtLiters(l.lastRefillLiters)
-                    : "-"}
+                  {l.lastRefillLiters !== undefined ? fmtLiters(l.lastRefillLiters) : "-"}
                 </TableCell>
                 <TableCell>
                   <Badge
                     variant={
-                      (l.checkMethod === "SENSOR"
-                        ? "secondary"
-                        : "outline") as any
+                      (l.checkMethod === "SENSOR" ? "secondary" : "outline") as any
                     }
                   >
                     {l.checkMethod}
                   </Badge>
                 </TableCell>
-                <TableCell className="font-mono text-[11px]">
-                  {l.checkedAt}
-                </TableCell>
+                <TableCell className="font-mono text-[11px]">{l.checkedAt}</TableCell>
                 <TableCell className="font-mono text-[11px]">
                   {l.checkedByOperatorId ?? "-"}
                 </TableCell>
                 <TableCell>
-                  {/* BUKAN GradeBadge karena ResinGrade di index.ts hanya A|B|C */}
                   <Badge variant="outline" className="font-mono text-[11px]">
                     {l.qualityGrade}
                   </Badge>
@@ -768,59 +888,20 @@ export default function PerformancePage() {
             <StateBadge state={data.shredder.state} />
           </CardHeader>
           <CardContent>
-            <InfoRow
-              label="Equipment ID"
-              value={data.shredder.equipmentId}
-              mono
-            />
+            <InfoRow label="Equipment ID" value={data.shredder.equipmentId} mono />
             <InfoRow label="Nama" value={data.shredder.name} />
             <InfoRow label="Pabrik" value={data.shredder.manufacturer} />
-            <InfoRow
-              label="Kapasitas"
-              value={`${data.shredder.capacityKgPerHour} kg/jam`}
-            />
-            <InfoRow
-              label="Hour Meter (Total)"
-              value={`${fmtNum(data.shredder.runtimeHoursTotal, 1)} jam`}
-            />
+            <InfoRow label="Kapasitas" value={`${data.shredder.capacityKgPerHour} kg/jam`} />
+            <InfoRow label="Hour Meter (Total)" value={`${fmtNum(data.shredder.runtimeHoursTotal, 1)} jam`} />
             <InfoRow
               label="Runtime Today"
-              value={
-                data.shredder.runtimeMinutesToday !== undefined
-                  ? `${data.shredder.runtimeMinutesToday} menit`
-                  : "-"
-              }
+              value={data.shredder.runtimeMinutesToday !== undefined ? `${data.shredder.runtimeMinutesToday} menit` : "-"}
             />
-            <InfoRow
-              label="Energy Today"
-              value={fmtKwh(data.shredder.energyKwhToday)}
-            />
-            <InfoRow
-              label="Output Shift"
-              value={
-                data.shredder.outputKgShift !== undefined
-                  ? fmtKg(data.shredder.outputKgShift)
-                  : "-"
-              }
-            />
-            <InfoRow
-              label="Output Today"
-              value={
-                data.shredder.outputKgToday !== undefined
-                  ? fmtKg(data.shredder.outputKgToday)
-                  : "-"
-              }
-            />
-            <InfoRow
-              label="Production Cycle ID"
-              value={data.shredder.productionCycleId ?? "-"}
-              mono
-            />
-            <InfoRow
-              label="Terakhir Servis"
-              value={data.shredder.lastServiceAt ?? "-"}
-              mono
-            />
+            <InfoRow label="Energy Today" value={fmtKwh(data.shredder.energyKwhToday)} />
+            <InfoRow label="Output Shift" value={data.shredder.outputKgShift !== undefined ? fmtKg(data.shredder.outputKgShift) : "-"} />
+            <InfoRow label="Output Today" value={data.shredder.outputKgToday !== undefined ? fmtKg(data.shredder.outputKgToday) : "-"} />
+            <InfoRow label="Production Cycle ID" value={data.shredder.productionCycleId ?? "-"} mono />
+            <InfoRow label="Terakhir Servis" value={data.shredder.lastServiceAt ?? "-"} mono />
           </CardContent>
         </Card>
 
@@ -830,59 +911,20 @@ export default function PerformancePage() {
             <StateBadge state={data.densitySeparator.state} />
           </CardHeader>
           <CardContent>
-            <InfoRow
-              label="Equipment ID"
-              value={data.densitySeparator.equipmentId}
-              mono
-            />
+            <InfoRow label="Equipment ID" value={data.densitySeparator.equipmentId} mono />
             <InfoRow label="Nama" value={data.densitySeparator.name} />
-            <InfoRow
-              label="Pabrik"
-              value={data.densitySeparator.manufacturer}
-            />
-            <InfoRow
-              label="Kapasitas"
-              value={`${data.densitySeparator.capacityKgPerHour} kg/jam`}
-            />
-            <InfoRow
-              label="Hour Meter (Total)"
-              value={`${fmtNum(data.densitySeparator.runtimeHoursTotal, 1)} jam`}
-            />
+            <InfoRow label="Pabrik" value={data.densitySeparator.manufacturer} />
+            <InfoRow label="Kapasitas" value={`${data.densitySeparator.capacityKgPerHour} kg/jam`} />
+            <InfoRow label="Hour Meter (Total)" value={`${fmtNum(data.densitySeparator.runtimeHoursTotal, 1)} jam`} />
             <InfoRow
               label="Runtime Cycle"
-              value={
-                data.densitySeparator.runtimeMinutesCycle !== undefined
-                  ? `${data.densitySeparator.runtimeMinutesCycle} menit`
-                  : "-"
-              }
+              value={data.densitySeparator.runtimeMinutesCycle !== undefined ? `${data.densitySeparator.runtimeMinutesCycle} menit` : "-"}
             />
-            <InfoRow
-              label="Energy Today"
-              value={fmtKwh(data.densitySeparator.energyKwhToday)}
-            />
-            <InfoRow
-              label="Output Batch"
-              value={
-                data.densitySeparator.outputKgBatch !== undefined
-                  ? fmtKg(data.densitySeparator.outputKgBatch)
-                  : "-"
-              }
-            />
-            <InfoRow
-              label="Batch ID"
-              value={data.densitySeparator.batchId ?? "-"}
-              mono
-            />
-            <InfoRow
-              label="Production Cycle ID"
-              value={data.densitySeparator.productionCycleId ?? "-"}
-              mono
-            />
-            <InfoRow
-              label="Terakhir Servis"
-              value={data.densitySeparator.lastServiceAt ?? "-"}
-              mono
-            />
+            <InfoRow label="Energy Today" value={fmtKwh(data.densitySeparator.energyKwhToday)} />
+            <InfoRow label="Output Batch" value={data.densitySeparator.outputKgBatch !== undefined ? fmtKg(data.densitySeparator.outputKgBatch) : "-"} />
+            <InfoRow label="Batch ID" value={data.densitySeparator.batchId ?? "-"} mono />
+            <InfoRow label="Production Cycle ID" value={data.densitySeparator.productionCycleId ?? "-"} mono />
+            <InfoRow label="Terakhir Servis" value={data.densitySeparator.lastServiceAt ?? "-"} mono />
           </CardContent>
         </Card>
       </div>
@@ -894,25 +936,10 @@ export default function PerformancePage() {
           <StateBadge state={data.dryingReusable.state} />
         </CardHeader>
         <CardContent>
-          <InfoRow
-            label="Pickup Liquid ID"
-            value={data.dryingReusable.pickupLiquidId}
-            mono
-          />
-          <InfoRow
-            label="Operator ID"
-            value={data.dryingReusable.operatorId}
-            mono
-          />
-          <InfoRow
-            label="Terakhir Diambil"
-            value={data.dryingReusable.lastPickedAt}
-            mono
-          />
-          <InfoRow
-            label="Total Cairan Diambil"
-            value={fmtLiters(data.dryingReusable.totalLiquidTakenLiters)}
-          />
+          <InfoRow label="Pickup Liquid ID" value={data.dryingReusable.pickupLiquidId} mono />
+          <InfoRow label="Operator ID" value={data.dryingReusable.operatorId} mono />
+          <InfoRow label="Terakhir Diambil" value={data.dryingReusable.lastPickedAt} mono />
+          <InfoRow label="Total Cairan Diambil" value={fmtLiters(data.dryingReusable.totalLiquidTakenLiters)} />
           <InfoRow
             label="Kondisi Kelembapan"
             value={
