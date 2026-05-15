@@ -118,9 +118,9 @@ Alur demo yang paling efektif untuk memperlihatkan nilai aplikasi secara cepat:
 
 ### Exported PDF
 
-| Print PDF |
-| :---: | 
-| ![Pdf](./public/capture-pdf.png) |
+| Detail Cycle PDF | Performance Analyst PDF | Performance Shiftlog PDF |
+| :---: | :---: | :---: | 
+| ![Pdf](./public/capture-pdf.png) | ![Pdf](./public/capture-performance-simple.png) | ![Pdf](./public/capture-performance-shiftlog.png) |
 
 ## 📁 Struktur Folder
 
